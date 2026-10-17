@@ -2,9 +2,12 @@
 Gemma core for the Plain-English Backtester + Investor Profiles.
 
 Setup (Google AI Studio, default):
-    pip install google-genai pydantic yfinance pandas numpy streamlit
-    Get a key at https://aistudio.google.com/apikey
-    export GEMINI_API_KEY="your-key"          # Windows PowerShell: $env:GEMINI_API_KEY="your-key"
+    pip install -r requirements.txt
+    Get a key at https://aistudio.google.com/apikey and put it in a .env file next to this script:
+        GEMINI_API_KEY=your-key
+        GEMMA_MODEL=gemma-4-31b-it
+        GEMMA_JSON_MODE=0
+    (.env is in .gitignore, so it never gets pushed. `export` in the terminal also still works.)
 
 Backup (local Ollama):
     pip install ollama ; ollama pull <gemma tag>
@@ -27,6 +30,13 @@ import numpy as np
 import yfinance as yf
 from pydantic import BaseModel, Field, ValidationError
 
+# Load settings from a .env file next to this script, if present (never committed: it's in .gitignore)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 BACKEND = os.getenv("GEMMA_BACKEND", "studio")                    # "studio" or "ollama"
 STUDIO_MODEL = os.getenv("GEMMA_MODEL", "gemma-4-26b-a4b-it")     # or "gemma-4-31b-it" (bigger, slower)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
@@ -42,7 +52,7 @@ DISCLAIMER = (
 # Shared: call Gemma, pull JSON out, validate against the schema, retry
 # =====================================================================
 _client = None
-_studio_json_mode = True  # flips off automatically if the API rejects JSON-schema mode for Gemma
+_studio_json_mode = os.getenv("GEMMA_JSON_MODE", "1") != "0"  # flips off automatically if the API rejects JSON-schema mode for Gemma
 
 
 def _studio_generate(system_prompt: str, user_text: str, schema: type[BaseModel]) -> str:
@@ -68,11 +78,11 @@ def _studio_generate(system_prompt: str, user_text: str, schema: type[BaseModel]
             return resp.text or ""
         except Exception as e:
             msg = str(e)
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:      # rate limited: back off and retry
-                time.sleep(2 * (attempt + 1))
-                continue
-            if _studio_json_mode and ("400" in msg or "INVALID_ARGUMENT" in msg):
+            if _studio_json_mode and any(k in msg for k in ("400", "INVALID_ARGUMENT", "500", "INTERNAL")):
                 _studio_json_mode = False                       # Gemma may not accept JSON mode: use prompt-only
+                continue
+            if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "500", "503", "INTERNAL", "UNAVAILABLE")):
+                time.sleep(2 * (attempt + 1))                   # rate limit / server hiccup: back off and retry
                 continue
             raise
     raise RuntimeError("Google AI Studio kept rate-limiting; wait a minute and try again.")
@@ -166,6 +176,9 @@ User: buy nvidia when RSI goes under 30, take profit at 10% or stop out at 5%
 
 User: get into SPY when it crosses above the 200 day average and hold 3 months
 {"supported": true, "unsupported_reason": null, "ticker": "SPY", "entry": {"type": "ma_cross", "direction": "above", "value": null, "window": 200}, "exit": {"hold_days": 63, "take_profit_pct": null, "stop_loss_pct": null}, "years": 5, "readback": "Buy SPY when price crosses above its 200-day average, sell 63 trading days later."}
+
+User: buy the dip on microsoft
+{"supported": true, "unsupported_reason": null, "ticker": "MSFT", "entry": {"type": "pct_change", "direction": "below", "value": -3, "window": 1}, "exit": {"hold_days": 10, "take_profit_pct": null, "stop_loss_pct": null}, "years": 5, "readback": "Buy MSFT after a 1-day drop of 3% or more (my reading of 'the dip'), sell 10 trading days later."}
 
 User: buy tesla before earnings if the CEO tweets something positive
 {"supported": false, "unsupported_reason": "Earnings dates and social media posts aren't supported yet.", "ticker": "TSLA", "entry": null, "exit": null, "years": 5, "readback": "Can't test this yet: it depends on earnings dates and tweets."}
@@ -349,7 +362,8 @@ if __name__ == "__main__":
         "buy coke when the CEO goes on TV",
     ]:
         s = parse_strategy(q)
-        print(q, "\n  ->", s.readback, "| supported:", s.supported, "\n")
+        print(q, "\n  ->", s.readback, "| supported:", s.supported,
+              "" if s.supported else f"| reason: {s.unsupported_reason}", "\n")
 
     # Warm the cache for demo tickers so the demo survives bad wifi
     for tk in ["AAPL", "KO", "NVDA", "SPY"]:
